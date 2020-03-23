@@ -1,0 +1,191 @@
+---
+# Install ArgoCD with argocd-operator v0.0.4 and apply all
+# neccessary fixes to get OpenShift authentication to work.
+#
+# NOTE: most of this will not be needed in coming releases of argocd-operator
+
+- name: Create Namespace
+  k8s:
+    host: "https://api.{{ ocp_cluster.name }}.{{ ocp_cluster.base_domain }}:6443"
+    validate_certs: no
+    api_version: v1
+    kind: Namespace
+    name: "{{ argocd.namespace }}"
+    state: present
+
+- name: Create OperatorGroup
+  k8s:
+    host: "https://api.{{ ocp_cluster.name }}.{{ ocp_cluster.base_domain }}:6443"
+    validate_certs: no
+    api_version: operators.coreos.com/v1
+    kind: OperatorGroup
+    name: argocd-operator
+    namespace: "{{ argocd.namespace }}"
+    state: present
+    definition:
+      spec:
+        targetNamespaces:
+        - "{{ argocd.namespace }}"
+
+- name: Install argocd-operator
+  k8s:
+    host: "https://api.{{ ocp_cluster.name }}.{{ ocp_cluster.base_domain }}:6443"
+    validate_certs: no
+    api_version: operators.coreos.com/v1alpha1
+    kind: Subscription
+    name: argocd-operator
+    namespace: "{{ argocd.namespace }}"
+    state: present
+    definition:
+      spec:
+        channel: alpha
+        name: argocd-operator
+        source: community-operators
+        sourceNamespace: openshift-marketplace
+
+- name: Create ArgoCD instance
+  k8s:
+    host: "https://api.{{ ocp_cluster.name }}.{{ ocp_cluster.base_domain }}:6443"
+    validate_certs: no
+    api_version: argoproj.io/v1alpha1
+    kind: ArgoCD
+    name: "{{ argocd.name }}"
+    namespace: "{{ argocd.namespace }}"
+    state: present
+    definition:
+      spec:
+        dex:
+          image: quay.io/dexidp/dex
+          version: v2.22.0
+          openShiftOAuth: true
+
+- name: Get argocd-dex-server ServiceAccount
+  k8s_info:
+    host: "https://api.{{ ocp_cluster.name }}.{{ ocp_cluster.base_domain }}:6443"
+    validate_certs: no
+    kind: ServiceAccount
+    name: argocd-dex-server
+    namespace: "{{ argocd.namespace }}"
+  register: argocd_dex_sa
+  until: argocd_dex_sa.resources[0].secrets is defined
+  retries: 5
+  delay: 1
+
+- name: Find Secret with token
+  set_fact:
+    token_secret: "{{ item.name }}"
+  loop: "{{ argocd_dex_sa.resources[0].secrets }}"
+  when: item.name | regex_search('(token)')
+
+- name: Get argocd-dex-server ServiceAccount token
+  k8s_info:
+    host: "https://api.{{ ocp_cluster.name }}.{{ ocp_cluster.base_domain }}:6443"
+    validate_certs: no
+    kind: Secret
+    name: "{{ token_secret }}"
+    namespace: "{{ argocd.namespace }}"
+  register: argocd_dex_token
+
+- name: Get Route
+  k8s_info:
+    host: "https://api.{{ ocp_cluster.name }}.{{ ocp_cluster.base_domain }}:6443"
+    validate_certs: no
+    kind: Route
+    name: "{{ argocd.name }}-server"
+    namespace: "{{ argocd.namespace }}"
+  register: argocd_route
+  until: argocd_route.resources[0].spec.host is defined
+  retries: 10
+  delay: 3
+
+#- debug:
+#    msg: "{{ argocd_route }}"
+
+- name: Add OAuth annotation to ServiceAccount
+  k8s:
+    host: "https://api.{{ ocp_cluster.name }}.{{ ocp_cluster.base_domain }}:6443"
+    validate_certs: no
+    kind: ServiceAccount
+    name: argocd-dex-server
+    namespace: "{{ argocd.namespace }}"
+    merge_type: json
+    definition:
+      metadata:
+        annotations:
+          serviceaccounts.openshift.io/oauth-redirecturi.argocd: "https://{{ argocd_route.resources[0].spec.host }}/api/dex/callback"
+
+- name: Add dex.config to ConfigMap
+  k8s:
+    host: "https://api.{{ ocp_cluster.name }}.{{ ocp_cluster.base_domain }}:6443"
+    validate_certs: no
+    kind: ConfigMap
+    name: argocd-cm
+    namespace: "{{ argocd.namespace }}"
+    definition:
+      data:
+        url: "https://{{ argocd_route.resources[0].spec.host }}"
+        dex.config: |
+          connectors:
+            # OpenShift
+            - type: openshift
+              id: openshift
+              name: OpenShift
+              config:
+                issuer: "https://api.{{ ocp_cluster.name }}.{{ ocp_cluster.base_domain }}:6443"
+                clientID: "system:serviceaccount:{{ argocd.namespace }}:argocd-dex-server"
+                clientSecret: "{{ argocd_dex_token.resources[0].data.token | b64decode }}"
+                redirectURI: "https://{{ argocd_route.resources[0].spec.host }}/api/dex/callback"
+                insecureCA: true
+                groups:
+                  - argocdusers
+                  - argocdadmins
+
+- name: Create OpenShift groups
+  k8s:
+    host: "https://api.{{ ocp_cluster.name }}.{{ ocp_cluster.base_domain }}:6443"
+    validate_certs: no
+    api_version: user.openshift.io/v1
+    kind: Group
+    name: "{{ item }}"
+    state: present
+  with_items:
+    - argocdusers
+    - argocdadmins
+
+- name: Update ArgoCD RBAC ConfigMap
+  k8s:
+    host: "https://api.{{ ocp_cluster.name }}.{{ ocp_cluster.base_domain }}:6443"
+    validate_certs: no
+    kind: ConfigMap
+    name: argocd-rbac-cm
+    namespace: "{{ argocd.namespace }}"
+    definition:
+      data:
+        policy.csv: |
+          g, argocdusers, role:readonly
+          g, argocdadmins, role:admin
+
+- name: Update argocd-server Deployment
+  k8s:
+    host: "https://api.{{ ocp_cluster.name }}.{{ ocp_cluster.base_domain }}:6443"
+    validate_certs: no
+    kind: Deployment
+    name: argocd-server
+    namespace: "{{ argocd.namespace }}"
+    state: present
+    definition:
+      spec:
+        template:
+          spec:
+            containers:
+            - name: argocd-server
+              command:
+              - argocd-server
+              - --dex-server
+              - http://argocd-dex-server:5556
+              - --redis
+              - argocd-redis:6379
+              - --repo-server
+              - argocd-repo-server:8081
+              - --staticassets
+              - /shared/app

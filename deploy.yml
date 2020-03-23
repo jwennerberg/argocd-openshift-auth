@@ -1,0 +1,13 @@
+---
+# Install ArgoCD with argocd-operator v0.0.4 and apply all
+# neccessary fixes to get OpenShift authentication to work.
+#
+# NOTE: most of this will not be needed in coming releases of argocd-operator
+
+- name: Install ArgoCD and configure OpenShift authentication
+  gather_facts: no
+  hosts: localhost
+  roles:
+    - argocd-openshift-auth
+
+

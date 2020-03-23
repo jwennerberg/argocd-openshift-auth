@@ -1,0 +1,10 @@
+---
+# defaults file for argocd-auth-ocp
+
+ocp_cluster:
+  name: crc
+  base_domain: testing
+
+argocd:
+  namespace: argocd
+  name: argocd
